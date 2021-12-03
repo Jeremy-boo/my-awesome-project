@@ -1,0 +1,381 @@
+apiVersion: devops.alauda.io/v1alpha1
+kind: ClusterPipelineTaskTemplate
+metadata:
+  name: dev-task-build-binary
+  annotations:
+    skip-scan: "true"
+    displayName.zh-CN: "zb二进制构建"
+    displayName.en: "Download Binary And Build Image"
+    description.zh-CN: "zb二进制构建"
+    description.en: "Download Binary And Build Image"
+    readme.zh-CN: "zb二进制构建"
+    readme.en: "zb二进制构建"
+    version: "1"
+    style.icon: ""
+  labels:
+    category: action
+spec:
+  engine: gotpl
+  body: |+
+    script {
+      container('tools'){
+        def alaudaDevopsInstance = alaudaDevops.newInstance()
+
+        def binaryRepositoryName=""
+        def binaryRepositoryNamespace=""
+        def tlsVerify = false
+        def binaryPath="{{.binaryPath}}"
+        def repositoryAddr = '{{.imageRepository.repositoryPath}}'.replace("http://","").replace("https://","")
+        def imageRegistryType = "{{ .imageRepository.imageRegistryType }}"
+        def artifactUrl=null
+        def imageCredentialId = "{{ .imageRepository.credentialId }}"
+
+        // imageRegistryTypeForSWR image registry type
+        def imageRegistryTypeForSWR = 'CCE-SWR'
+
+        {{if .binaryRepository -}}
+        binaryRepositoryName="{{.binaryRepository.name}}"
+        binaryRepositoryNamespace="{{.binaryRepository.namespace}}"
+        {{- end}}
+
+        env.IMAGE_REPO = repositoryAddr
+        env.IMAGE_REGISTRY_SERVER = repositoryAddr.replaceAll("/.*","")
+
+        if(binaryPath.length()>0&&" ".equals(binaryPath.substring(0,1))){
+          binaryPath=binaryPath.substring(1)
+        }
+
+        writeFile file: "Dockerfile", text: "{{.dockerfile}}"
+
+        alaudaDevopsInstance.withCluster() {
+          // 判断是否选择触发器
+          // 通过params是否有triggerRepository和triggerPath来判断是否是模版
+          if (params.triggerRepository != null && params.triggerPath != null && params.triggerRepository != "" && params.triggerPath != "") {
+              def split = params.triggerRepository.split("/")
+              binaryRepositoryName = split[0]
+              binaryRepositoryNamespace = split[1]
+              binaryPath = params.triggerPath
+          }
+          def binding = null;
+
+          alaudaDevopsInstance.withProject(binaryRepositoryNamespace) {
+            binding = alaudaDevopsInstance.selector("artifactregistrybinding.devops.alauda.io", binaryRepositoryName).object()
+          }
+
+          def ar = null
+
+          for(def o:binding.metadata.ownerReferences){
+            if("ArtifactRegistry".equals(o.kind)){
+              ar = alaudaDevopsInstance.selector("artifactregistry.devops.alauda.io", o.name).object()
+            }
+          }
+
+          host = ar.spec.http.host
+
+          if (host.lastIndexOf("/")==host.length()-1){
+              host=host.substring(0,host.length()-1);
+          }
+
+          artifactUrl=host+"/repository/"+ar.spec.artifactRegistryName+"/"+binaryPath
+
+          def secretNS = ar.spec.secret.namespace
+          def secretName = ar.spec.secret.name
+
+          def usernameString = null
+          def passwordString = null
+
+          alaudaDevopsInstance.withProject(secretNS) {
+            withCredentials([usernamePassword(credentialsId: secretNS+"-"+secretName, passwordVariable: 'PASSWD', usernameVariable: 'USER')]) {
+              usernameString = "${USER}"
+              passwordString = "${PASSWD}"
+            }
+          }
+
+          sh script: """
+            curl -OLv --user '$usernameString:$passwordString' '$artifactUrl'
+          """
+
+          def imageRepoTag = "${IMAGE_REPO}"
+          def buildImages = []
+          def tags = []
+
+          {{- if eq .imageRepository.tag "" }}
+          tags = ['latest']
+          {{- else }}
+          def tagswithcomma = "{{.imageRepository.tag}}"
+          tags = tagswithcomma.split(",")
+          {{- end }}
+
+          imageRepoTag = "${IMAGE_REPO}:${tags[0]}"
+
+          def buildahContainerExists = false;
+          try {
+            container('buildah'){
+              sh script: "buildah --version"
+              buildahContainerExists = true;
+            }
+          } catch (e) {
+              println("We did not find a usable buildah container, so we will use the docker container as an alternative")
+          }
+          printf("buildahContainerExists is %s", buildahContainerExists)
+
+          if (buildahContainerExists) {
+            container('buildah') {
+                try{
+                if (imageCredentialId != '') {
+                    // 判断仓库类型是否是SWR，如果是动态获取秘钥，不是走以前默认逻辑
+                    if (imageRegistryType == imageRegistryTypeForSWR) {
+                        // it's for cce-swr image repositry,get default-secret from cluster's default ns
+                        def secretDataInfo = []
+                        container('tools'){
+                          alaudaDevops.withCluster(){
+                            alaudaDevops.withProject("default") {
+                              echo "Hello from ${alaudaDevops.cluster()}'s non-default project: ${alaudaDevops.project()}"
+                              def saSelector = alaudaDevops.selector( 'secret','default-secret').object()
+                              secretDataInfo = saSelector.data
+                            }
+                          }
+                        }
+                        // 解析dockerconfigjson
+                        def secretJsonInfo = sh (script: "echo ${secretDataInfo[".dockerconfigjson"]} | base64 -d",returnStdout: true)
+                        def dockerSecretFilename = "docker-secret." + new Random().nextInt(Integer.MAX_VALUE).toString()
+                        writeFile file: dockerSecretFilename, text: secretJsonInfo
+                        def dockerSecretInfo = readJSON file: dockerSecretFilename
+                        sh script: "rm -rf ${dockerSecretFilename}"
+
+                        // 根据地址获取相应swr token信息
+                        def realSecretData = dockerSecretInfo["auths"][IMAGE_REGISTRY_SERVER]
+                        // 二次解密密钥信息
+                        def realSerecreMapInfo = sh (script: "echo ${realSecretData["auth"]} | base64 -d",returnStdout: true)
+
+                        // 切割字符串,_registrytoken:eyJhbGciOiJSUzI1N
+                        def values = realSerecreMapInfo.split(':')
+                        def swrUername = values[0]
+
+                        // curl 请求cce 获取token
+                        withCredentials([usernamePassword(credentialsId: "${credentialId}", passwordVariable: 'PASSWD', usernameVariable: 'USER')]) {
+                            def newTokenInfo = sh returnStdout: true, script: "curl -k  --request POST 'https://'${IMAGE_REGISTRY_SERVER}'/auth/realms/CCE/protocol/openid-connect/token' --header 'Content-Type: application/x-www-form-urlencoded' --header 'Content-Type: application/x-www-form-urlencoded' --data-urlencode 'client_id=cce-client' --data-urlencode 'grant_type=password' --data-urlencode 'username=${USER}' --data-urlencode 'password=${PASSWD}' --data-urlencode 'scope=openid' --data-urlencode 'response_type=code' "
+                            sh script: "echo ${newTokenInfo}"
+                            def newTokenInfoFilename = "docker-secret." + new Random().nextInt(Integer.MAX_VALUE).toString()
+                            writeFile file: newTokenInfoFilename, text: newTokenInfo
+                            def newJsonTokenInfo = readJSON file: newTokenInfoFilename
+                            sh script: "rm -rf ${newTokenInfoFilename}"
+                            def authSecret = newJsonTokenInfo["access_token"]
+                            // login to registry
+                            def randFilename = "registry-password." + new Random().nextInt(Integer.MAX_VALUE).toString()
+                            writeFile file: randFilename, text: authSecret
+                            sh script: "cat ${randFilename} | buildah login --tls-verify=${tlsVerify} -u ${swrUername} --password-stdin ${IMAGE_REGISTRY_SERVER}", label: 'login to registry'
+                            sh script: "rm -rf ${randFilename}"
+                        }
+                    }else {
+                      withCredentials([usernamePassword(credentialsId: "${imageCredentialId}", passwordVariable: 'PASSWD', usernameVariable: 'USER')]) {
+                        def randFilename = "registry-password." + new Random().nextInt(Integer.MAX_VALUE).toString()
+                        writeFile file: randFilename, text: PASSWD
+                        sh script: "cat ${randFilename} | buildah login --tls-verify=${tlsVerify} -u ${USER} --password-stdin ${IMAGE_REGISTRY_SERVER}", label: 'login to registry'
+                        sh script: "rm -rf ${randFilename}"
+                      }
+                    }
+                  }
+                }
+                catch(err){
+                    error err.getMessage()
+                }
+                sh script: "buildah bud --tls-verify=${tlsVerify} -t ${imageRepoTag} -f Dockerfile {{.buildArguments}} {{ if .context }}{{.context}}{{else}}.{{end}}", label: 'build image'
+                sh script: "buildah push --tls-verify=${tlsVerify} ${imageRepoTag}", label: 'push image'
+            }
+            buildImages.add(imageRepoTag as String)
+
+            // handle multi tags
+            if(tags.size() > 1){
+                if (imageCredentialId != '') {
+                    // 判断仓库类型是否是SWR，如果是动态获取秘钥，不是走以前默认逻辑
+                    if (imageRegistryType == imageRegistryTypeForSWR) {
+                        // it's for cce-swr image repositry,get default-secret from cluster's default ns
+                        def secretDataInfo = []
+                        container('tools'){
+                          alaudaDevops.withCluster(){
+                            alaudaDevops.withProject("default") {
+                              echo "Hello from ${alaudaDevops.cluster()}'s non-default project: ${alaudaDevops.project()}"
+                              def saSelector = alaudaDevops.selector( 'secret','default-secret').object()
+                              secretDataInfo = saSelector.data
+                            }
+                          }
+                        }
+                        // 解析dockerconfigjson
+                        def secretJsonInfo = sh (script: "echo ${secretDataInfo[".dockerconfigjson"]} | base64 -d",returnStdout: true)
+                        def dockerSecretFilename = "docker-secret." + new Random().nextInt(Integer.MAX_VALUE).toString()
+                        writeFile file: dockerSecretFilename, text: secretJsonInfo
+                        def dockerSecretInfo = readJSON file: dockerSecretFilename
+                        sh script: "rm -rf ${dockerSecretFilename}"
+
+                        // 根据地址获取相应swr token信息
+                        def realSecretData = dockerSecretInfo["auths"][IMAGE_REGISTRY_SERVER]
+                        // 二次解密密钥信息
+                        def realSerecreMapInfo = sh (script: "echo ${realSecretData["auth"]} | base64 -d",returnStdout: true)
+
+                        // 切割字符串,_registrytoken:eyJhbGciOiJSUzI1N
+                        def values = realSerecreMapInfo.split(':')
+                        def swrUername = values[0]
+
+                        // curl 请求cce 获取token
+                        withCredentials([usernamePassword(credentialsId: "${credentialId}", passwordVariable: 'PASSWD', usernameVariable: 'USER')]) {
+                            def newTokenInfo = sh returnStdout: true, script: "curl -k  --request POST 'https://'${IMAGE_REGISTRY_SERVER}'/auth/realms/CCE/protocol/openid-connect/token' --header 'Content-Type: application/x-www-form-urlencoded' --header 'Content-Type: application/x-www-form-urlencoded' --data-urlencode 'client_id=cce-client' --data-urlencode 'grant_type=password' --data-urlencode 'username=${USER}' --data-urlencode 'password=${PASSWD}' --data-urlencode 'scope=openid' --data-urlencode 'response_type=code' "
+                            sh script: "echo ${newTokenInfo}"
+                            def newTokenInfoFilename = "docker-secret." + new Random().nextInt(Integer.MAX_VALUE).toString()
+                            writeFile file: newTokenInfoFilename, text: newTokenInfo
+                            def newJsonTokenInfo = readJSON file: newTokenInfoFilename
+                            sh script: "rm -rf ${newTokenInfoFilename}"
+                            def authSecret = newJsonTokenInfo["access_token"]
+                            // login to registry
+                            def randFilename = "registry-password." + new Random().nextInt(Integer.MAX_VALUE).toString()
+                            writeFile file: randFilename, text: authSecret
+                            sh script: "cat ${randFilename} | buildah login --tls-verify=${tlsVerify} -u ${swrUername} --password-stdin ${IMAGE_REGISTRY_SERVER}", label: 'login to registry'
+                            sh script: "rm -rf ${randFilename}"
+                        }
+                    }else {
+                      withCredentials([usernamePassword(credentialsId: "${imageCredentialId}", passwordVariable: 'PASSWD', usernameVariable: 'USER')]) {
+                        def randFilename = "registry-password." + new Random().nextInt(Integer.MAX_VALUE).toString()
+                        writeFile file: randFilename, text: PASSWD
+                        sh script: "cat ${randFilename} | skopeo login --tls-verify=${tlsVerify} -u ${USER} --password-stdin ${IMAGE_REGISTRY_SERVER}", label: 'login to registry'
+                        sh script: "rm -rf ${randFilename}"
+                      }
+                    }
+                }
+                for(int i = 1; i < tags.size(); i++){
+                    def newRepoTag = "${IMAGE_REPO}:${tags[i]}"
+                    sh script: "skopeo copy docker://${imageRepoTag} docker://${newRepoTag} --all --dest-tls-verify=${tlsVerify} --src-tls-verify=${tlsVerify}", label: 'copy image'
+                    buildImages.add(newRepoTag as String)
+                }
+              }
+          } else {
+              if (imageCredentialId != '') {
+                withCredentials([usernamePassword(credentialsId: "${imageCredentialId}", passwordVariable: 'PASSWD', usernameVariable: 'USER')]) {
+                    writeFile file: 'docker-password', text: PASSWD
+                    sh "cat docker-password | docker login ${IMAGE_REGISTRY_SERVER} -u ${USER} --password-stdin"
+                    sh "rm docker-password"
+                }
+              }
+
+              {{- if eq .imageRepository.tag "" }}
+                  def imageRepoTag = "${IMAGE_REPO}:latest"
+                  sh " docker build -t ${imageRepoTag} -f Dockerfile {{.buildArguments}} {{ if .context }}{{.context}}{{else}}.{{end}}"
+                  docker push ${imageRepoTag}
+                  buildImages.add(imageRepoTag as String)
+              {{- else }}
+                  def incubatorimage = "${IMAGE_REPO}:${tags[0]}"
+                  sh " docker build -t ${incubatorimage} -f Dockerfile {{.buildArguments}} {{ if .context }}{{.context}}{{else}}.{{end}}"
+                  tags.each { tag ->
+                  sh """
+                      docker tag ${incubatorimage} ${IMAGE_REPO}:${tag}
+                      docker push ${IMAGE_REPO}:${tag}
+                  """
+                  buildImages.add("${IMAGE_REPO}:${tag}" as String)
+                  }
+              {{- end }}
+              if (imageCredentialId != '') {
+                  sh "docker logout ${IMAGE_REGISTRY_SERVER}"
+              }
+          }
+        }
+      }
+    }
+  arguments:
+    - name: artifactSource
+      schema:
+        type: string
+        enum:
+          - "manual"
+          - "trigger"
+      display:
+        type: radio
+        advanced: false
+        name:
+          zh-CN: "制品来源"
+          en: "Artifact source"
+        enumAlias:
+          - "手动输入"
+        description:
+          zh-CN: '"手动输入"指由用户指定要下载的制品，仅支持指定单个制品。'
+          en: "Please select the product source that you want Docker to build. 'Product library trigger' refers to the product that triggers the product library trigger, and 'manual input' refers to the product that the user specifies to download, only supporting the specification of a single product"
+      required: true
+      default: "manual"
+
+    - name: "binaryRepository"
+      schema:
+        type: alauda.io/toolbinding
+      required: true
+      display:
+        type: alauda.io/toolbinding
+        args:
+          bindingKind: artifactregistry
+          bindingToolType: Raw
+        name:
+          zh-CN: "制品仓库"
+          en: Artifact Repository
+        description:
+          zh-CN: "请选择要Docker构建的制品所在的制品仓库，仅支持选择分配到当前项目的Raw仓库。"
+          en: "Select the artifact warehouse where the artifact you want Docker to build is located, and only the Raw repository that is assigned to the current project is supported"
+      relation:
+        - action: show
+          when:
+            name: artifactSource
+            value: "manual"
+
+    - name: "binaryPath"
+      schema:
+        type: string
+      required: true
+      display:
+        type: string
+        name:
+          zh-CN: "制品路径"
+          en: BinaryPath
+        description:
+          zh-CN: "制品在制品库中存储的路径，需精确到制品名称，如a/b/c/jar。"
+          en: "The path that artifacts are stored in the Artifacts Repository"
+      relation:
+        - action: show
+          when:
+            name: artifactSource
+            value: "manual"
+
+    - name: "imageRepository"
+      schema:
+        type: alauda.io/dockerimagerepositorymix
+      required: true
+      display:
+        type: alauda.io/dockerimagerepositorymix
+        name:
+          zh-CN: "镜像仓库"
+          en: Repository
+        description:
+          zh-CN: "选择已为项目分配的镜像仓库或者输入镜像仓库地址，Docker构建出的镜像将push到该镜像仓库。"
+          en: "Select the image warehouse that has been assigned to the project or enter the address of the image warehouse, and the image built by Docker will be pushed to the image warehouse"
+
+    - name: "buildArguments"
+      schema:
+        type: string
+      display:
+        type: string
+        name:
+          zh-CN: "构建参数"
+          en: "Build Arguments"
+        description:
+          zh-CN: "自定义build Options，如 --add-host，多个 Options 用空格隔开；可参考 https://docs.docker.com/engine/reference/commandline/build/。"
+          en: "Customize Docker build Options, such as --add-host. Multiple Options are separated by Spaces. Refer to https://docs.docker.com/engine/reference/commandline/build/"
+      required: false
+      default: ""
+
+    - name: "dockerfile"
+      schema:
+        type: string
+      display:
+        type: code
+        name:
+          zh-CN: "Dockerfile"
+          en: "Dockerfile"
+        description:
+          zh-CN: "请以文本的方式输入Dockerfile"
+          en: "Please enter Dockerfile as text"
+      required: true
+      default: ""

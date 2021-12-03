@@ -16,6 +16,8 @@ spec:
       containers:
       - name: go-app-container
         image: jermybo/hello:1.0
+        imagePullSecrets:
+          - name: default-secret
         resources:
           limits:
             memory: "128Mi"

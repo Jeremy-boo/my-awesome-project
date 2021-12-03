@@ -1,0 +1,357 @@
+apiVersion: devops.alauda.io/v1alpha1
+kind: ClusterPipelineTaskTemplate
+metadata:
+  name: dev-docker-build
+  annotations:
+    skip-scan: "true"
+    displayName.zh-CN: "zb镜像构建"
+    displayName.en: "Image Build"
+    description.zh-CN: "通过Buildah构建镜像"
+    description.en: "Build image by Buildah"
+    readme.zh-CN: "zb镜像构建"
+    readme.en: "Image Build"
+    version: "1"
+    style.icon: "kubernetes"
+  labels:
+    category: CI
+spec:
+  engine: gotpl
+  body: |+
+    script {
+        def retryCount = {{ if .retry }}{{ .retry }}{{else}}0{{end}}
+        def repositoryAddr = '{{.imageRepository.repositoryPath}}'.replace("http://","").replace("https://","")
+        def IMAGE_REPO = repositoryAddr
+        def IMAGE_REGISTRY_SERVER = repositoryAddr.replaceAll("/.*","")
+        def imageRegistryType = "{{ .imageRepository.imageRegistryType }}"
+
+        def credentialId = ''
+        credentialId = "{{ .imageRepository.credentialId }}"
+        def tlsVerify = false
+        def imageRepoTag = "${IMAGE_REPO}"
+        def tags = []
+        // imageRegistryTypeForSWR image registry type
+        def imageRegistryTypeForSWR = 'CCE-SWR'
+
+        def buildahContainerExists = false;
+        try {
+          container('buildah'){
+            sh script: "buildah --version"
+            buildahContainerExists = true;
+          }
+        } catch (e) {
+            println("We did not find a usable buildah container, so we will use the docker container as an alternative")
+        }
+        printf("buildahContainerExists is %s", buildahContainerExists)
+
+        if (buildahContainerExists) {
+          dir(RELATIVE_DIRECTORY) {
+            container('buildah'){
+                retry(retryCount) {
+                    def buildImages = []
+                    if (credentialId != '') {
+                        // 判断仓库类型是否是SWR，如果是动态获取秘钥，不是走以前默认逻辑
+                        if (imageRegistryType == imageRegistryTypeForSWR) {
+                            // it's for cce-swr image repositry,get default-secret from cluster's default ns
+                            def secretDataInfo = []
+                            container('tools'){
+                              alaudaDevops.withCluster(){
+                                alaudaDevops.withProject("default") {
+                                  def saSelector = alaudaDevops.selector( 'secret','default-secret').object()
+                                  secretDataInfo = saSelector.data
+                                }
+                              }
+                            }
+                            // 解析dockerconfigjson
+                            def secretJsonInfo = sh (script: "echo ${secretDataInfo[".dockerconfigjson"]} | base64 -d",returnStdout: true)
+                            def dockerSecretFilename = "docker-secret." + new Random().nextInt(Integer.MAX_VALUE).toString()
+                            writeFile file: dockerSecretFilename, text: secretJsonInfo
+                            def dockerSecretInfo = readJSON file: dockerSecretFilename
+                            sh script: "rm -rf ${dockerSecretFilename}"
+
+                            // 根据地址获取相应swr token信息
+                            def realSecretData = dockerSecretInfo["auths"][IMAGE_REGISTRY_SERVER]
+                            // 二次解密密钥信息
+                            def realSerecreMapInfo = sh (script: "echo ${realSecretData["auth"]} | base64 -d",returnStdout: true)
+
+                            // 切割字符串,_registrytoken:eyJhbGciOiJSUzI1N
+                            def values = realSerecreMapInfo.split(':')
+                            def swrUername = values[0]
+
+                            // curl 请求cce 获取token
+                            withCredentials([usernamePassword(credentialsId: "${credentialId}", passwordVariable: 'PASSWD', usernameVariable: 'USER')]) {
+                                def newTokenInfo = sh returnStdout: true, script: "curl -k  --request POST 'https://'${IMAGE_REGISTRY_SERVER}'/auth/realms/CCE/protocol/openid-connect/token' --header 'Content-Type: application/x-www-form-urlencoded' --header 'Content-Type: application/x-www-form-urlencoded' --data-urlencode 'client_id=cce-client' --data-urlencode 'grant_type=password' --data-urlencode 'username=${USER}' --data-urlencode 'password=${PASSWD}' --data-urlencode 'scope=openid' --data-urlencode 'response_type=code' "
+                                sh script: "echo ${newTokenInfo}"
+                                def newTokenInfoFilename = "docker-secret." + new Random().nextInt(Integer.MAX_VALUE).toString()
+                                writeFile file: newTokenInfoFilename, text: newTokenInfo
+                                def newJsonTokenInfo = readJSON file: newTokenInfoFilename
+                                sh script: "rm -rf ${newTokenInfoFilename}"
+                                def authSecret = newJsonTokenInfo["access_token"]
+                                // login to registry
+                                def randFilename = "registry-password." + new Random().nextInt(Integer.MAX_VALUE).toString()
+                                writeFile file: randFilename, text: authSecret
+                                sh script: "cat ${randFilename} | buildah login --tls-verify=${tlsVerify} -u ${swrUername} --password-stdin ${IMAGE_REGISTRY_SERVER}", label: 'login to registry'
+                                sh script: "rm -rf ${randFilename}"
+                            }
+                        } else {
+                              // else image repositry like harbor...
+                              withCredentials([usernamePassword(credentialsId: "${credentialId}", passwordVariable: 'PASSWD', usernameVariable: 'USER')]) {
+                                def randFilename = "registry-password." + new Random().nextInt(Integer.MAX_VALUE).toString()
+                                writeFile file: randFilename, text: PASSWD
+                                sh script: "cat ${randFilename} | buildah login --tls-verify=${tlsVerify} -u ${USER} --password-stdin ${IMAGE_REGISTRY_SERVER}", label: 'login to registry'
+                                sh script: "rm -rf ${randFilename}"
+                            }
+                        }
+                    }
+                    {{- if eq .imageRepository.tag "" }}
+                    tags = ['latest']
+                    {{- else }}
+                    def tagswithcomma = "{{.imageRepository.tag}}"
+                    tags = tagswithcomma.split(",")
+                    {{- end }}
+
+                    imageRepoTag = "${IMAGE_REPO}:${tags[0]}"
+                    try {
+                        sh script: "buildah bud --tls-verify=${tlsVerify} -t ${imageRepoTag} -f {{.dockerfile}} {{.buildArguments}} {{ if .context }}{{.context}}{{else}}.{{end}}", label: 'build image'
+                        sh script: "buildah push --tls-verify=${tlsVerify} ${imageRepoTag}", label: 'push image'
+
+                        buildImages.add(imageRepoTag as String)
+
+                        container('tools'){
+                          // handle multi tags
+                          if(tags.size() > 1){
+                            if (credentialId != '') {
+                                // 判断仓库类型是否是SWR，如果是动态获取秘钥，不是走以前默认逻辑
+                                if (imageRegistryType == imageRegistryTypeForSWR) {
+                                  // it's for cce-swr image repositry,get default-secret from cluster's default ns
+                                  def secretDataInfo = []
+                                  alaudaDevops.withCluster(){
+                                    alaudaDevops.withProject("default") {
+                                      def saSelector = alaudaDevops.selector( 'secret','default-secret').object()
+                                      secretDataInfo = saSelector.data
+                                    }
+                                  }
+                                  // 解析dockerconfigjson
+                                  def secretJsonInfo = sh (script: "echo ${secretDataInfo[".dockerconfigjson"]} | base64 -d",returnStdout: true)
+                                  def dockerSecretFilename = "docker-secret." + new Random().nextInt(Integer.MAX_VALUE).toString()
+                                  writeFile file: dockerSecretFilename, text: secretJsonInfo
+                                  def dockerSecretInfo = readJSON file: dockerSecretFilename
+                                  sh script: "rm -rf ${dockerSecretFilename}"
+
+                                  // 根据地址获取相应swr token信息
+                                  def realSecretData = dockerSecretInfo["auths"][IMAGE_REGISTRY_SERVER]
+                                  // 二次解密密钥信息
+                                  def realSerecreMapInfo = sh (script: "echo ${realSecretData["auth"]} | base64 -d",returnStdout: true)
+                                  echo "auth信息：${realSerecreMapInfo}"
+
+                                  // 切割字符串,_registrytoken:eyJhbGciOiJSUzI1N
+                                  def values = realSerecreMapInfo.split(':')
+                                  def swrUername = values[0]
+
+                                  // curl 请求cce 获取token
+                                  withCredentials([usernamePassword(credentialsId: "${credentialId}", passwordVariable: 'PASSWD', usernameVariable: 'USER')]) {
+                                      def newTokenInfo = sh returnStdout: true, script: "curl -k  --request POST 'https://'${IMAGE_REGISTRY_SERVER}'/auth/realms/CCE/protocol/openid-connect/token' --header 'Content-Type: application/x-www-form-urlencoded' --header 'Content-Type: application/x-www-form-urlencoded' --data-urlencode 'client_id=cce-client' --data-urlencode 'grant_type=password' --data-urlencode 'username=${USER}' --data-urlencode 'password=${PASSWD}' --data-urlencode 'scope=openid' --data-urlencode 'response_type=code' "
+                                      sh script: "echo ${newTokenInfo}"
+                                      def newTokenInfoFilename = "docker-secret." + new Random().nextInt(Integer.MAX_VALUE).toString()
+                                      writeFile file: newTokenInfoFilename, text: newTokenInfo
+                                      def newJsonTokenInfo = readJSON file: newTokenInfoFilename
+                                      sh script: "rm -rf ${newTokenInfoFilename}"
+                                      def authSecret = newJsonTokenInfo["access_token"]
+                                      // login to registry
+                                      def randFilename = "registry-password." + new Random().nextInt(Integer.MAX_VALUE).toString()
+                                      writeFile file: randFilename, text: authSecret
+                                      sh script: "cat ${randFilename} | buildah login --tls-verify=${tlsVerify} -u ${swrUername} --password-stdin ${IMAGE_REGISTRY_SERVER}", label: 'login to registry'
+                                      sh script: "rm -rf ${randFilename}"
+                                  }
+                              } else {
+                                  // login to registry
+                                  withCredentials([usernamePassword(credentialsId: "${credentialId}", passwordVariable: 'PASSWD', usernameVariable: 'USER')]) {
+                                      def randFilename = "registry-password." + new Random().nextInt(Integer.MAX_VALUE).toString()
+                                      writeFile file: randFilename, text: PASSWD
+                                      sh script: "cat  ${randFilename} | skopeo login --tls-verify=${tlsVerify} -u ${USER} --password-stdin ${IMAGE_REGISTRY_SERVER}", label: 'login to registry'
+                                      sh script: "rm -rf ${randFilename}"
+                                  }
+                                }
+                            }
+                            for(int i = 1; i < tags.size(); i++){
+                                def newRepoTag = "${IMAGE_REPO}:${tags[i]}"
+                                sh script: "skopeo copy docker://${imageRepoTag} docker://${newRepoTag} --all --dest-tls-verify=${tlsVerify} --src-tls-verify=${tlsVerify}", label: 'copy image'
+                                buildImages.add(newRepoTag as String)
+                            }
+                          }
+                        }
+
+                        alaudaPipeline.appendInfo(STAGE_NAME, [build_image: buildImages], '_Docker')
+                    } catch (err) {
+                        error err.getMessage()
+                    }
+                }
+            }
+          }
+        } else {
+          dir(RELATIVE_DIRECTORY) {
+              container('tools'){
+                  retry(retryCount) {
+                      def buildImages = []
+                      if (credentialId != '') {
+                        // 判断仓库类型是否是SWR，如果是动态获取秘钥，不是走以前默认逻辑
+                        if (imageRegistryType == imageRegistryTypeForSWR) {
+                            // it's for cce-swr image repositry,get default-secret from cluster's default ns
+                            def secretDataInfo = []
+                            alaudaDevops.withCluster(){
+                                alaudaDevops.withProject("default") {
+                                  def saSelector = alaudaDevops.selector( 'secret','default-secret').object()
+                                  secretDataInfo = saSelector.data
+                                }
+                            }
+                            // 解析dockerconfigjson
+                            def secretJsonInfo = sh (script: "echo ${secretDataInfo[".dockerconfigjson"]} | base64 -d",returnStdout: true)
+                            def dockerSecretFilename = "docker-secret." + new Random().nextInt(Integer.MAX_VALUE).toString()
+                            writeFile file: dockerSecretFilename, text: secretJsonInfo
+                            def dockerSecretInfo = readJSON file: dockerSecretFilename
+                            sh script: "rm -rf ${dockerSecretFilename}"
+
+                            // 根据地址获取相应swr token信息
+                            def realSecretData = dockerSecretInfo["auths"][IMAGE_REGISTRY_SERVER]
+                            // 二次解密密钥信息
+                            def realSerecreMapInfo = sh (script: "echo ${realSecretData["auth"]} | base64 -d",returnStdout: true)
+
+                            // 切割字符串,_registrytoken:eyJhbGciOiJSUzI1N
+                            def values = realSerecreMapInfo.split(':')
+                            def swrUername = values[0]
+
+                            // curl 请求cce 获取token
+                            withCredentials([usernamePassword(credentialsId: "${credentialId}", passwordVariable: 'PASSWD', usernameVariable: 'USER')]) {
+                                def newTokenInfo = sh returnStdout: true, script: "curl -k  --request POST 'https://'${IMAGE_REGISTRY_SERVER}'/auth/realms/CCE/protocol/openid-connect/token' --header 'Content-Type: application/x-www-form-urlencoded' --header 'Content-Type: application/x-www-form-urlencoded' --data-urlencode 'client_id=cce-client' --data-urlencode 'grant_type=password' --data-urlencode 'username=${USER}' --data-urlencode 'password=${PASSWD}' --data-urlencode 'scope=openid' --data-urlencode 'response_type=code' "
+                                sh script: "echo ${newTokenInfo}"
+                                def newTokenInfoFilename = "docker-secret." + new Random().nextInt(Integer.MAX_VALUE).toString()
+                                writeFile file: newTokenInfoFilename, text: newTokenInfo
+                                def newJsonTokenInfo = readJSON file: newTokenInfoFilename
+                                sh script: "rm -rf ${newTokenInfoFilename}"
+                                def authSecret = newJsonTokenInfo["access_token"]
+                                // login to registry
+                                def randFilename = "registry-password." + new Random().nextInt(Integer.MAX_VALUE).toString()
+                                writeFile file: randFilename, text: authSecret
+                                sh script: "cat ${randFilename} | buildah login --tls-verify=${tlsVerify} -u ${swrUername} --password-stdin ${IMAGE_REGISTRY_SERVER}", label: 'login to registry'
+                                sh script: "rm -rf ${randFilename}"
+                            }
+                        } else {
+                            // else image repositry like harbor...
+                            withCredentials([usernamePassword(credentialsId: "${credentialId}", passwordVariable: 'PASSWD', usernameVariable: 'USER')]) {
+                              def randFilename = "registry-password." + new Random().nextInt(Integer.MAX_VALUE).toString()
+                              writeFile file: randFilename, text: PASSWD
+                              sh script: "cat ${randFilename} | docker login --tls-verify=${tlsVerify} -u ${USER} --password-stdin ${IMAGE_REGISTRY_SERVER}", label: 'login to registry'
+                              sh script: "rm -rf ${randFilename}"
+                        }
+                      }
+
+                      {{- if eq .imageRepository.tag "" }}
+                        def imageRepoTag = "${IMAGE_REPO}:latest"
+                        def image = docker.build("${imageRepoTag}", "-f {{.dockerfile}} {{.buildArguments}} {{ if .context }}{{.context}}{{else}}.{{end}}")
+                        image.push()
+
+                        buildImages.add(imageRepoTag as String)
+                      {{- else }}
+                        def tagswithcomma = "{{.imageRepository.tag}}"
+                        tags = tagswithcomma.split(",")
+                        def incubatorimage = "${IMAGE_REPO}:${tags[0]}"
+                        def image = docker.build(incubatorimage, "-f {{.dockerfile}} {{.buildArguments}} {{ if .context }}{{.context}}{{else}}.{{end}}")
+                        tags.each { tag ->
+                          image.tag(tag)
+                          image.push(tag)
+
+                          buildImages.add("${IMAGE_REPO}:${tag}" as String)
+                        }
+                      {{- end }}
+
+                      alaudaPipeline.appendInfo(STAGE_NAME, [build_image: buildImages], '_Docker')
+                  }
+              }
+          }
+        }
+    }
+  arguments:
+    - name: "imageRepository"
+      schema:
+        type: alauda.io/dockerimagerepositorymix
+      required: true
+      display:
+        type: alauda.io/dockerimagerepositorymix
+        name:
+          zh-CN: "镜像仓库"
+          en: Repository
+        description:
+          zh-CN: "选择或者输入镜像仓库"
+          en: ""
+    - name: "dockerfile"
+      schema:
+        type: string
+      display:
+        type: string
+        name:
+          zh-CN: "Dockerfile"
+          en: "Dockerfile"
+        description:
+          zh-CN: "Dockerfile 在代码仓库中的绝对路径"
+          en: ""
+      required: true
+      default: "Dockerfile"
+    - name: "context"
+      schema:
+        type: string
+      display:
+        type: string
+        name:
+          zh-CN: "构建上下文"
+          en: "Build Context"
+        description:
+          zh-CN: "构建过程可以引用上下文中的任何文件。例如，构建中可以使用 COPY 命令在上下文中引用文件"
+          en: "The build process can refer to any of the files in the context. For example, your build can use a COPY instruction to reference a file in the context"
+      required: false
+      default: "."
+    - name: "buildArguments"
+      schema:
+        type: string
+      display:
+        type: string
+        name:
+          zh-CN: "构建参数"
+          en: "Build Arguments"
+        description:
+          zh-CN: "自定义build Options，如 --add-host，多个 Options 用空格隔开；可参考 https://docs.docker.com/engine/reference/commandline/build/"
+          en: ""
+      required: false
+      default: ""
+    - name: "retry"
+      schema:
+        type: string
+      display:
+        type: string
+        name:
+          zh-CN: "重试次数"
+          en: "Retry Times"
+        description:
+          zh-CN: "生成镜像时的失败重试次数"
+          en: ""
+      required: false
+      default: "3"
+  exports:
+    - name: IMAGE_REPO
+      description:
+        zh-CN: 镜像仓库
+        en: Image Repo
+  dependencies:
+    plugins:
+      - name: workflow-basic-steps
+        version: "2.9"
+      - name: docker-workflow
+        version: "1.17"
+  view:
+    markdown: |-
+      {{ if eq $item.type "_Docker"}}
+      ## {{$item.name}}
+
+      | Name | Value |
+      | :--- | :---- |
+      | 镜像地址 | {{ range $index, $v := $item.value.build_image }}{{if ne $index 0}},{{end}}{{$v}}{{end}} |
+
+      {{ end}}
